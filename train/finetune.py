@@ -18,8 +18,8 @@ Embeddings (clm)
   --hf-dataset REPO    native or parquet embedding dataset (defaults from
                        --benchmark when no CLM data source is supplied)
   --data FILE          step transitions (.json / .jsonl), embedded from scratch
-choice always embeds from scratch, with offline vLLM or a vLLM pooling server
-(``--embed-url``).
+choice always embeds from scratch, with offline vLLM, a vLLM pooling server
+(``--embed-url``) or the in-process Unsloth encoder (``--embed-backend unsloth``).
 
 Checkpoints hold state_head / action_head / logit_scale / cfg.
 """
@@ -117,6 +117,25 @@ def _make_stratified_folds(index_path: str, k: int, out_dir: str,
     return paths, summary
 
 
+def _local_4bit(args) -> bool | None:
+    """Resolved 4-bit choice of the in-process encoder; None for vLLM."""
+    if args.embed_url or args.embed_backend == "vllm":
+        return None
+    from clm.unsloth_embedder import resolve_4bit
+    return resolve_4bit({"auto": None, "4bit": True, "16bit": False}[args.embed_quant])
+
+
+def _embed_tag(args) -> str:
+    """Cache-name suffix, so 4-bit encoder embeddings never mix with 16-bit ones."""
+    four = _local_4bit(args)
+    return "" if four is None else f"_{args.embed_backend}-{'4bit' if four else '16bit'}"
+
+
+def _embed_backend(args):
+    return embed_utils.make_backend(args.embed_url, args.embed_model, args.max_len, args.gpu_mem,
+                                    args.served_model_name, args.embed_backend, _local_4bit(args))
+
+
 def clm_embedding_dir(args) -> str:
     """Resolve the CLM data source to an embedding dir (building it if needed)."""
     if args.emb_dir:
@@ -127,14 +146,13 @@ def clm_embedding_dir(args) -> str:
     if args.hf_dataset:
         return hf_embeddings.download(args.hf_dataset, os.path.join(cache, _slug(args.hf_dataset)),
                                       cache_dir=args.hf_cache, split=args.hf_split)
-    out = os.path.join(cache, "clm_" + _slug(os.path.splitext(os.path.basename(args.data))[0]))
+    out = os.path.join(cache, "clm_" + _slug(os.path.splitext(os.path.basename(args.data))[0]) + _embed_tag(args))
     if hf_embeddings.is_embedding_dir(out):
         print(f"[clm] reusing embeddings in {out}", flush=True)
         return out
     recs = adapters.read_transitions(args.data)
+    backend = _embed_backend(args)
     recipe = embed_utils.Recipe(args.embed_model, args.max_len)
-    backend = embed_utils.make_backend(args.embed_url, args.embed_model, args.max_len, args.gpu_mem,
-                                       args.served_model_name)
     print(f"[clm] embedding {len(recs)} steps from scratch", flush=True)
     se = backend.embed([recipe.state_ids(r["state"]) for r in recs])
     ae = backend.embed([recipe.text_ids(r["action"], keep="head") for r in recs])
@@ -465,13 +483,12 @@ def run_choice(args) -> dict:
           " ".join(f"{k} {len(v)}" for k, v in ex.items()), flush=True)
 
     cache = TextCache(os.path.join(args.embed_cache or os.path.join(args.out_dir, "embeddings"),
-                                   f"choice_{_slug(args.embed_model)}_{args.max_len}.npz"))
+                                   f"choice_{_slug(args.embed_model)}_{args.max_len}{_embed_tag(args)}.npz"))
     texts = [t for v in ex.values() for e in v for t in (e.state_text, *e.candidates)]
     todo = cache.missing(texts)
     if todo:
+        backend = _embed_backend(args)
         recipe = embed_utils.Recipe(args.embed_model, args.max_len)
-        backend = embed_utils.make_backend(args.embed_url, args.embed_model, args.max_len, args.gpu_mem,
-                                           args.served_model_name)
         print(f"[choice] embedding {len(todo)} unique texts", flush=True)
         cache.add(todo, backend.embed([recipe.text_ids(t, keep="tail") for t in todo]))
 
@@ -590,6 +607,8 @@ def run_choice(args) -> dict:
                 "cfg": {**cfg, "projection_dim": proj, "hidden_size": HIDDEN, "task": "choice",
                         "targets": args.targets, "loss": args.loss, "data": args.data, "workflow": args.workflow,
                         "embed_model": args.embed_model, "max_len": args.max_len,
+                        "embed_backend": "server" if args.embed_url else args.embed_backend,
+                        "embed_4bit": _local_4bit(args),
                         "init_ckpt": os.path.basename(args.init_ckpt) if args.init_ckpt else None},
                 "epoch": epoch, "metrics": metrics}
 
@@ -660,6 +679,11 @@ def main() -> None:
     emb = ap.add_argument_group("from-scratch embedding")
     emb.add_argument("--embed-model", default="Qwen/Qwen3-8B")
     emb.add_argument("--embed-url", default=None, help="vLLM /v1/embeddings server; offline vLLM if unset")
+    emb.add_argument("--embed-backend", choices=["vllm", "unsloth", "hf"], default="vllm",
+                     help="without --embed-url: offline vLLM, or the encoder in this process via Unsloth "
+                          "(or plain transformers)")
+    emb.add_argument("--embed-quant", choices=["auto", "4bit", "16bit"], default="auto",
+                     help="unsloth/hf weights: 4-bit on GPUs under 20 GB by default")
     emb.add_argument("--served-model-name", default=None, help="model name the server was started with")
     emb.add_argument("--max-len", type=int, default=None, help="token budget (default 8192 clm, 2048 choice)")
     emb.add_argument("--gpu-mem", type=float, default=0.85)
