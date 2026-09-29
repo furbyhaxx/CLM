@@ -172,6 +172,11 @@ def main() -> None:
     ap.add_argument("--emb-model", default=os.environ.get("CLM_EMB_MODEL", "qwen3-8b"))
     ap.add_argument("--max-tokens", type=int, default=int(os.environ.get("CLM_EMB_MAX_TOKENS", 2048)),
                     help="truncate texts to this many tokens before embedding (the embedder's max-model-len)")
+    ap.add_argument("--local-encoder", nargs="?", const="Qwen/Qwen3-8B", default=None, metavar="MODEL",
+                    help="run the encoder in this process (Unsloth when installed, else transformers) "
+                         "instead of calling --emb-url; MODEL defaults to Qwen/Qwen3-8B")
+    ap.add_argument("--local-quant", choices=["auto", "4bit", "16bit"], default="auto",
+                    help="--local-encoder weights: 4-bit on GPUs under 20 GB by default")
     ap.add_argument("--ckpt", default=os.environ.get("CLM_CKPT"),
                     help=f"checkpoint served as clm-latest (default: {DEFAULT_CKPT_DIR}/{HF_FILE}, downloaded if missing)")
     ap.add_argument("--ckpt-dir", default=None, help="also serve every *.pt in this directory under its file stem")
@@ -200,7 +205,13 @@ def main() -> None:
             raise SystemExit(f"--model expects NAME=PATH, got {spec!r}")
         extra[name] = path
     device = args.device or default_device()
-    engine = Engine(Embedder(args.emb_url, args.emb_model, max_tokens=args.max_tokens), checkpoint=ckpt,
+    if args.local_encoder:
+        from .unsloth_embedder import UnslothEmbedder
+        embedder = UnslothEmbedder(args.local_encoder, max_tokens=args.max_tokens,
+                                   load_in_4bit={"auto": None, "4bit": True, "16bit": False}[args.local_quant])
+    else:
+        embedder = Embedder(args.emb_url, args.emb_model, max_tokens=args.max_tokens)
+    engine = Engine(embedder, checkpoint=ckpt,
                     models=extra, checkpoint_dir=args.ckpt_dir, device=device,
                     action_cache=args.action_cache)
     if not engine.heads and not extra:
@@ -208,7 +219,8 @@ def main() -> None:
     api_key = os.environ.get("CLM_API_KEY")
     app = create_app(engine, api_key, ui=not args.no_ui, cors=args.cors)
     print(f"[clm] models {[m['name'] for m in engine.models()]} on {device}", flush=True)
-    print(f"[clm] embedder {args.emb_url} ({args.emb_model}) {'up' if engine.embedder.healthy() else 'NOT REACHABLE'}; "
+    where = f"in-process {args.local_encoder}" if args.local_encoder else f"{args.emb_url} ({args.emb_model})"
+    print(f"[clm] embedder {where} {'up' if engine.embedder.healthy() else 'NOT REACHABLE'}; "
           f"auth {'on' if api_key else 'off'}", flush=True)
     arena = engine.arena
     if arena:

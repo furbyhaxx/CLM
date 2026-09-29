@@ -62,6 +62,10 @@ vllm serve Qwen/Qwen3-8B --served-model-name qwen3-8b --runner pooling --max-mod
 clm-serve
 ```
 
+No vLLM? `clm-serve --local-encoder` runs Qwen3-8B inside the server process with
+[Unsloth](https://github.com/unslothai/unsloth) (plain transformers if Unsloth is not
+installed), in 4-bit on GPUs under 20 GB. See [Colab notebooks](#colab-notebooks-no-vllm).
+
 States longer than 2048 tokens are truncated. For longer states, raise both limits
 together, e.g. `--max-model-len 8192` on `vllm serve` and `clm-serve --max-tokens 8192`
 (needs more GPU memory).
@@ -110,6 +114,30 @@ engine.rank("What causes tides on Earth?",
 
 engine.answer(state, questions)      # the same dict the HTTP endpoint returns, no server needed
 ```
+
+---
+
+## Colab notebooks (no vLLM)
+
+| notebook | what it does | free T4 |
+| --- | --- | --- |
+| [CLM_Inference](notebooks/CLM_Inference.ipynb) [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/furbyhaxx/CLM/blob/main/notebooks/CLM_Inference.ipynb) | typed questions, ranking, cache latency; serves the API + playground from Colab | yes |
+| [CLM_Eval](notebooks/CLM_Eval.ipynb) [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/furbyhaxx/CLM/blob/main/notebooks/CLM_Eval.ipynb) | DeepSWE best-of-4 (31/38) from the published embeddings; typed-decisions accuracy end to end | yes |
+| [CLM_Finetune](notebooks/CLM_Finetune.ipynb) [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/furbyhaxx/CLM/blob/main/notebooks/CLM_Finetune.ipynb) | heads on typed decisions; DeepSWE verifier heads; LoRA on the encoder jointly with the heads | yes (DeepSWE: high-RAM) |
+
+The notebooks use the [Unsloth](https://github.com/unslothai/unsloth) Colab install and load
+Qwen3-8B in-process through `clm.unsloth_embedder`: the final-norm hidden state of the last
+token, L2-normalised, which is the vector `vllm serve --runner pooling` returns. Anything that
+takes an embedder can use it:
+
+```python
+from clm import Engine, UnslothEmbedder
+engine = Engine(embedder=UnslothEmbedder())       # Qwen/Qwen3-8B; 4-bit on GPUs under 20 GB
+```
+
+`train/finetune.py --embed-backend unsloth` embeds with it too. The released heads were
+trained on 16-bit embeddings, so the 4-bit encoder on a T4 is a close approximation; an L4 or
+A100 loads it in 16-bit.
 
 ---
 
@@ -353,6 +381,7 @@ The code in this repository is released under the [Apache 2.0 License](LICENSE).
 │   ├── engine.py                #   Engine.answer(...) / Engine.rank(...): the inference engine
 │   ├── heads.py                 #   head architecture, checkpoint load / hot-reload / download
 │   ├── embedder.py              #   /v1/embeddings client + LRU cache of normalised embeddings
+│   ├── unsloth_embedder.py      #   the same, with Qwen3-8B in-process (Unsloth / transformers)
 │   ├── cache.py                 #   the reserved vector arena behind --action-cache
 │   ├── server.py                #   FastAPI app, `clm-serve`
 │   └── static/                  #   the playground: index.html + app.css + app.js, no build step
@@ -361,6 +390,7 @@ The code in this repository is released under the [Apache 2.0 License](LICENSE).
 │   ├── finetune.py              #   trains the projection heads on a frozen encoder
 │   ├── adapters.py              #   dataset adapters: agentic traces, typed decisions
 │   └── embed_utils.py           #   encoder embeddings with the training token recipe
+├── notebooks/                   # Colab: inference, eval, fine-tuning with Unsloth (no vLLM)
 ├── evaluation/bon_eval.py            # unified best-of-N evaluation
 ├── preprocessing/hf_embeddings.py    # embedding dir <-> Hugging Face dataset
 ├── requirements.txt             # pip install -r requirements.txt  (clm + torch + vLLM + example deps)
@@ -427,6 +457,7 @@ files only; every API route above shadows it.
 clm-serve [--port 8700] [--emb-url http://127.0.0.1:8090/v1/embeddings] [--emb-model qwen3-8b]
           [--max-tokens 2048] [--ckpt PATH] [--ckpt-dir DIR] [--model NAME=PATH ...] [--device cpu|cuda]
           [--action-cache 0.02|512MiB|0] [--no-ui] [--cors]
+          [--local-encoder [MODEL]] [--local-quant auto|4bit|16bit]
 ```
 
 `--ckpt PATH` serves your own head as `clm-latest` (default: the reference
@@ -437,6 +468,10 @@ The heads run on the GPU when torch sees one, else on the CPU; `--device` (or
 `Authorization: Bearer <key>` (the playground has a field for it). Environment
 equivalents: `CLM_PORT`, `CLM_EMB_URL`, `CLM_EMB_MODEL`, `CLM_CKPT`,
 `CLM_DEVICE`, `CLM_ACTION_CACHE`.
+
+`--local-encoder` replaces the `--emb-url` server with an in-process encoder (default
+`Qwen/Qwen3-8B`, or a LoRA adapter directory from `notebooks/CLM_Finetune.ipynb`), loaded
+with Unsloth when installed and in 4-bit below 20 GB unless `--local-quant` says otherwise.
 
 `--no-ui` drops the playground and serves the API alone. `--cors` allows browser
 requests from any origin and is off by default, because an API key otherwise

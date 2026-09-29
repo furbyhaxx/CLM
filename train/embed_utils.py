@@ -6,8 +6,9 @@ DeepSWE precompute in the research repo's ``main`` branch.
 * ``Recipe.text_ids``: text without special tokens; ``keep="head"`` keeps the first
   ``max_len - 1`` tokens, ``keep="tail"`` the last.
 
-Backends take token ids: ``OfflineBackend`` (in-process vLLM) and ``ServerBackend``
-(``vllm serve <model> --runner pooling``).
+Backends take token ids: ``OfflineBackend`` (in-process vLLM), ``ServerBackend``
+(``vllm serve <model> --runner pooling``) and ``LocalBackend`` (in-process Unsloth or
+transformers, ``clm.unsloth_embedder``; no vLLM needed, e.g. on Colab).
 """
 from __future__ import annotations
 
@@ -101,6 +102,30 @@ class ServerBackend:
         return l2(np.stack(out).astype(np.float32))
 
 
-def make_backend(url: str | None, model: str, max_len: int, gpu_mem: float = 0.85, served_name: str | None = None):
-    """Server backend when ``url`` is given, else offline vLLM."""
-    return ServerBackend(url, served_name or model) if url else OfflineBackend(model, max_len, gpu_mem)
+class LocalBackend:
+    """In-process Unsloth / transformers backbone (``clm.unsloth_embedder``), loaded on first use."""
+
+    def __init__(self, model: str, max_len: int, backend: str | None = None, load_in_4bit: bool | None = None):
+        self.model, self.max_len, self.backend, self.load_in_4bit = model, max_len, backend, load_in_4bit
+        self._enc = None
+        if backend == "unsloth":
+            import unsloth  # noqa: F401  (patches transformers; must come before Recipe loads it)
+
+    def embed(self, id_lists: list[list[int]]) -> np.ndarray:
+        if self._enc is None:
+            from clm.unsloth_embedder import LocalEncoder
+            self._enc = LocalEncoder(self.model, max_tokens=self.max_len, load_in_4bit=self.load_in_4bit,
+                                     backend=self.backend)
+            print(f"[embed] local {self.model} ({type(self._enc.model).__name__})", flush=True)
+        return self._enc.embed_ids(id_lists, progress=True)
+
+
+def make_backend(url: str | None, model: str, max_len: int, gpu_mem: float = 0.85, served_name: str | None = None,
+                 backend: str = "vllm", load_in_4bit: bool | None = None):
+    """Server backend when ``url`` is given; else offline vLLM (``backend="vllm"``) or the
+    in-process encoder (``"unsloth"`` / ``"hf"``)."""
+    if url:
+        return ServerBackend(url, served_name or model)
+    if backend in ("unsloth", "hf"):
+        return LocalBackend(model, max_len, backend, load_in_4bit)
+    return OfflineBackend(model, max_len, gpu_mem)
